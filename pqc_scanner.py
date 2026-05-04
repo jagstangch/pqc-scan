@@ -110,6 +110,7 @@ class PQCProbeResult:
     is_pqc: bool = False
     is_hybrid: bool = False
     standard: str = ""
+    via_hrr: bool = False   # True when group was signalled via HelloRetryRequest
     error: Optional[str] = None
 
 @dataclass
@@ -259,10 +260,32 @@ def build_client_hello(host: str, groups: list[int]) -> bytes:
 
 def parse_server_hello(data: bytes) -> dict:
     """
-    Parse a ServerHello to extract selected cipher suite and key_share group.
-    Returns dict with keys: cipher_suite, selected_group, tls_version
+    Parse a ServerHello or HelloRetryRequest (HRR) to extract the selected
+    cipher suite, key_share group, and TLS version.
+
+    HRR detection: RFC 8446 §4.1.4 — when the ServerHello random field equals
+    the SHA-256 hash of "HelloRetryRequest", the message is an HRR.
+    In an HRR the key_share extension carries only 2 bytes (the chosen group
+    ID); there is no key material.  This is still a definitive signal that the
+    server supports and prefers that group.
+
+    Returns dict keys:
+      cipher_suite    int   — negotiated cipher suite
+      selected_group  int   — named group ID (from key_share)
+      tls_version     int   — 0x0304 for TLS 1.3, etc.
+      is_hrr          bool  — True when this message is a HelloRetryRequest
+      alert           tuple — (level, desc) if an Alert record was received
+      error / parse_error — on failure
     """
-    result = {}
+    # RFC 8446 §4.1.4 — the specific random value that marks an HRR
+    HRR_MAGIC = bytes([
+        0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
+        0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+        0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
+        0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+    ])
+
+    result: dict = {"is_hrr": False}
     pos = 0
 
     def read(n):
@@ -278,14 +301,14 @@ def parse_server_hello(data: bytes) -> dict:
         return struct.unpack("!H", read(2))[0]
 
     try:
-        # TLS Record header: type(1) + version(2) + length(2)
+        # ── TLS Record header: type(1) + version(2) + length(2) ─────────────
         rec_type = read_u8()
         rec_version = read_u16()
         rec_len = read_u16()
 
         if rec_type == 0x15:  # Alert
             alert_level = read_u8()
-            alert_desc = read_u8()
+            alert_desc  = read_u8()
             result["alert"] = (alert_level, alert_desc)
             return result
 
@@ -293,22 +316,27 @@ def parse_server_hello(data: bytes) -> dict:
             result["error"] = f"Unexpected record type: {rec_type:#04x}"
             return result
 
-        # Handshake header: type(1) + length(3)
+        # ── Handshake header: type(1) + length(3) ───────────────────────────
         hs_type = read_u8()
-        hs_len = struct.unpack("!I", b"\x00" + read(3))[0]
+        hs_len  = struct.unpack("!I", b"\x00" + read(3))[0]
 
-        if hs_type != 0x02:  # Not ServerHello
+        if hs_type != 0x02:  # Not ServerHello / HRR
             result["error"] = f"Expected ServerHello (0x02), got {hs_type:#04x}"
             return result
 
-        # ServerHello body
+        # ── ServerHello / HRR body ───────────────────────────────────────────
         server_version = read_u16()
-        server_random = read(32)
+        server_random  = read(32)
+
+        # Detect HelloRetryRequest by its fixed magic random value
+        if server_random == HRR_MAGIC:
+            result["is_hrr"] = True
+
         session_id_len = read_u8()
-        session_id = read(session_id_len)
-        cipher_suite = read_u16()
+        session_id     = read(session_id_len)
+        cipher_suite   = read_u16()
         result["cipher_suite"] = cipher_suite
-        compression = read_u8()
+        compression    = read_u8()
 
         if pos >= 5 + hs_len:
             return result
@@ -316,22 +344,30 @@ def parse_server_hello(data: bytes) -> dict:
         ext_total_len = read_u16()
         ext_end = pos + ext_total_len
 
-        result["tls_version"] = server_version  # may be overridden by supported_versions
+        result["tls_version"]    = server_version  # overridden below if supported_versions present
         result["selected_group"] = None
 
         while pos < ext_end:
             ext_type = read_u16()
-            ext_len = read_u16()
+            ext_len  = read_u16()
             ext_data = data[pos:pos + ext_len]
             pos += ext_len
 
             if ext_type == 0x002B and ext_len == 2:
-                # supported_versions — actual negotiated version
+                # supported_versions — actual negotiated / requested TLS version
                 result["tls_version"] = struct.unpack("!H", ext_data)[0]
 
             elif ext_type == 0x0033:
-                # key_share — selected group (only in ServerHello, not HRR)
-                if ext_len >= 4:
+                # key_share extension — two different formats:
+                #
+                #   Regular ServerHello: group_id(2) + key_len(2) + key(key_len)
+                #     → ext_len >= 4 and we read the first 2 bytes as group_id
+                #
+                #   HelloRetryRequest:   group_id(2) only
+                #     → ext_len == 2; the server is telling us "retry with this group"
+                #
+                # Both cases: the group ID is always the first 2 bytes.
+                if ext_len >= 2:
                     group_id = struct.unpack("!H", ext_data[:2])[0]
                     result["selected_group"] = group_id
 
@@ -416,33 +452,48 @@ def _parse_cert(der: bytes) -> CertInfo:
     return ci
 
 
+def _read_tls_record(sock: socket.socket) -> bytes:
+    """
+    Read exactly one complete TLS record from sock.
+    Returns the raw bytes (header + payload) or b"" on EOF.
+    """
+    header = b""
+    while len(header) < 5:
+        chunk = sock.recv(5 - len(header))
+        if not chunk:
+            return b""
+        header += chunk
+    payload_len = struct.unpack("!H", header[3:5])[0]
+    payload = b""
+    while len(payload) < payload_len:
+        chunk = sock.recv(payload_len - len(payload))
+        if not chunk:
+            break
+        payload += chunk
+    return header + payload
+
+
 def probe_pqc(host: str, port: int, timeout: float) -> PQCProbeResult:
     """
-    Layer 2: Send a raw ClientHello advertising PQC groups.
-    Parse the ServerHello to see which key_share group was selected.
+    Layer 2: Send a raw ClientHello advertising every known PQC group.
+    Parse the response — either a ServerHello or a HelloRetryRequest (HRR) —
+    to determine which key_share group the server selected or requested.
+
+    HRR flow (common with Cloudflare / Google):
+      Client → ClientHello  (supported_groups includes X25519MLKEM768, …;
+                              key_share only contains x25519)
+      Server → HRR          (key_share ext = 2 bytes: preferred group ID)
+      → We detect the HRR group and report it as the PQC verdict.
     """
     result = PQCProbeResult()
     try:
         hello = build_client_hello(host, ALL_PROBE_GROUPS)
         with socket.create_connection((host, port), timeout=timeout) as sock:
-            sock.sendall(hello)
-            # Read up to 4 KB (enough for ServerHello)
-            resp = b""
             sock.settimeout(timeout)
-            try:
-                while len(resp) < 4096:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    resp += chunk
-                    # Stop once we likely have a full ServerHello
-                    if len(resp) >= 5:
-                        # TLS record length
-                        rec_len = struct.unpack("!H", resp[3:5])[0]
-                        if len(resp) >= 5 + rec_len:
-                            break
-            except socket.timeout:
-                pass
+            sock.sendall(hello)
+
+            # Read the first TLS record (ServerHello or HRR)
+            resp = _read_tls_record(sock)
 
         if not resp:
             result.error = "No response from server"
@@ -460,15 +511,18 @@ def probe_pqc(host: str, port: int, timeout: float) -> PQCProbeResult:
             return result
 
         selected = parsed.get("selected_group")
+        is_hrr   = parsed.get("is_hrr", False)
         result.server_selected_group_id = selected
 
         if selected is not None:
             if selected in PQC_GROUPS:
                 info = PQC_GROUPS[selected]
                 result.server_selected_group_name = info["name"]
-                result.is_pqc = True
+                result.is_pqc    = True
                 result.is_hybrid = info["hybrid"]
-                result.standard = info["standard"]
+                result.standard  = info["standard"]
+                if is_hrr:
+                    result.via_hrr = True   # stored for report display
             elif selected in CLASSICAL_GROUPS:
                 result.server_selected_group_name = CLASSICAL_GROUPS[selected]
                 result.is_pqc = False
@@ -476,7 +530,7 @@ def probe_pqc(host: str, port: int, timeout: float) -> PQCProbeResult:
                 result.server_selected_group_name = f"unknown ({selected:#06x})"
                 result.is_pqc = False
         else:
-            result.error = "Server did not send key_share (may be TLS 1.2 or HRR)"
+            result.error = "Server did not send key_share (TLS 1.2, or no matching group)"
 
     except ConnectionRefusedError:
         result.error = "Connection refused"
@@ -587,18 +641,19 @@ def scan(target: str, timeout: float = 5.0, skip_openssl: bool = False) -> ScanR
     openssl_pqc = any("[PQC keyword" in l for l in result.openssl_groups)
 
     if probe and probe.is_pqc:
+        hrr_note = " (negotiated via HelloRetryRequest)" if probe.via_hrr else ""
         if probe.is_hybrid:
             result.verdict = "YES (Hybrid PQC)"
             result.verdict_reason = (
                 f"Server selected hybrid PQC key exchange: {probe.server_selected_group_name} "
-                f"(group {probe.server_selected_group_id:#06x}, {probe.standard}). "
+                f"(group {probe.server_selected_group_id:#06x}, {probe.standard}){hrr_note}. "
                 "Classical + post-quantum security."
             )
         else:
             result.verdict = "YES (Pure PQC)"
             result.verdict_reason = (
                 f"Server selected pure PQC key exchange: {probe.server_selected_group_name} "
-                f"(group {probe.server_selected_group_id:#06x}, {probe.standard})."
+                f"(group {probe.server_selected_group_id:#06x}, {probe.standard}){hrr_note}."
             )
     elif openssl_pqc:
         result.verdict = "PARTIAL / LIKELY YES"
@@ -690,6 +745,7 @@ def print_report(r: ScanResult, no_color: bool = False, json_out: bool = False):
         if p.server_selected_group_id is not None:
             print(f"  Selected group ID   : {p.server_selected_group_id:#06x}")
             print(f"  Selected group name : {p.server_selected_group_name}")
+            print(f"  Detected via HRR    : {'YES' if p.via_hrr else 'NO'}")
             print(f"  Is PQC group        : {'YES' if p.is_pqc else 'NO'}")
             if p.is_pqc:
                 print(f"  Hybrid (PQ+classic) : {'YES' if p.is_hybrid else 'NO'}")
